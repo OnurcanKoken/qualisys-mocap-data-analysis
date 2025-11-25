@@ -9,4 +9,4 @@ bags/
 *.log
 
 # mcap files
-.mcap
+*.mcap
