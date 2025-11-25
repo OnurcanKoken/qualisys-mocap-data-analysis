@@ -1,0 +1,12 @@
+# Ignore your bags folder
+bags/
+
+# Virtual environments
+.env
+.venv
+
+# Logs
+*.log
+
+# mcap files
+.mcap
