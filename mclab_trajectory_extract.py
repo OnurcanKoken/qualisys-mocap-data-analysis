@@ -416,6 +416,7 @@ def run_visualization(data, bag_path):
             rec_traj_line.set_visible(False)
 
         n_rec = int(record_mask.sum())
+        traj_here = int(traj_id[idx])
 
         L = 18
         line1 = f"{'Time (sec):'.ljust(L)} {time_abs:.6f} s (t0+{time_rel_i:.3f})"
@@ -425,8 +426,11 @@ def run_visualization(data, bag_path):
         line5 = f"{'Orientation [deg]:'.ljust(L)} roll={roll:+.2f}, pitch={pitch:+.2f}, yaw={yaw:+.2f}"
         line6 = f"{'Recording:'.ljust(L)} {'ON' if recording else 'OFF'}"
         line7 = f"{'Recorded samples:'.ljust(L)} {n_rec}"
+        line8 = f"{'Trajectory no:'.ljust(L)} {traj_here} (total={current_traj_id})"
 
-        pose_text.set_text("\n".join([line1, line2, line3, line4, line5, line6, line7]))
+        pose_text.set_text("\n".join(
+            [line1, line2, line3, line4, line5, line6, line7, line8]
+        ))
 
         # REC indicator color
         rec_indicator.set_color("red" if recording else "gray")
@@ -447,9 +451,21 @@ def run_visualization(data, bag_path):
         update_index(idx, allow_record=False)
 
     def on_rec_clicked(event):
-        nonlocal recording, current_traj_id
+        nonlocal recording, current_traj_id, record_mask, traj_id
+
         old_state = recording
-        recording = not recording
+        new_state = not recording
+
+        # If we were recording and now turning OFF: clamp future samples
+        if old_state and not new_state and current_traj_id > 0:
+            # Any samples with this traj_id AFTER current idx are cleared
+            future_idx = np.where((traj_id == current_traj_id) & (np.arange(n) > idx))[0]
+            if future_idx.size > 0:
+                record_mask[future_idx] = False
+                traj_id[future_idx] = 0
+
+        # Apply new state
+        recording = new_state
 
         # Starting a new trajectory segment
         if (not old_state) and recording:
