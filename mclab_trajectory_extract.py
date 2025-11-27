@@ -22,11 +22,13 @@ def load_rigidbody_data(mcap_path, topic="/rigid_bodies", rb_name="0"):
     """
     Reads /rigid_bodies messages from an MCAP file and returns a dict:
       {
-        "t":     (N,)   float64  absolute time [s]
-        "frame": (N,)   int64    frame_number (valid-only)
-        "pos":   (N,3) float64  x,y,z
-        "quat":  (N,4) float64  [x,y,z,w] (unit quaternions)
-        "rpy":   (N,3) float64  roll,pitch,yaw [deg]
+        "t":        (N,)   float64   absolute time [s]
+        "frame":    (N,)   int64     frame_number (valid-only)
+        "pos":      (N,3) float64   x,y,z
+        "quat":     (N,4) float64   [x,y,z,w] (unit quaternions)
+        "rpy":      (N,3) float64   roll,pitch,yaw [deg]
+        "Rmat":     (N,3,3) float64 rotation matrices
+        "human_time": list[str]    local time strings
       }
     """
     times = []
@@ -37,14 +39,11 @@ def load_rigidbody_data(mcap_path, topic="/rigid_bodies", rb_name="0"):
     for msg in read_ros2_messages(mcap_path, topics=[topic]):
         ros_msg = msg.ros_msg
 
-        # Time from header (sec + nanosec)
         t = ros_msg.header.stamp.sec + ros_msg.header.stamp.nanosec * 1e-9
 
-        # No rigid bodies in this message
         if not ros_msg.rigidbodies:
             continue
 
-        # Select rigid body
         if rb_name is None:
             rb = ros_msg.rigidbodies[0]
         else:
@@ -77,7 +76,7 @@ def load_rigidbody_data(mcap_path, topic="/rigid_bodies", rb_name="0"):
     positions = np.array(positions, dtype=float)
     quats = np.array(quats, dtype=float)
 
-    # Filter quaternions (NaN / Inf / zero)
+    # Filter invalid quaternions
     norms = np.linalg.norm(quats, axis=1)
     finite_mask = np.isfinite(quats).all(axis=1)
     nonzero_mask = norms > 1e-6
@@ -103,8 +102,19 @@ def load_rigidbody_data(mcap_path, topic="/rigid_bodies", rb_name="0"):
     norms = np.linalg.norm(quats, axis=1, keepdims=True)
     quats = quats / norms
 
+    # Precompute rotation object
     rot = R.from_quat(quats)
     rpy = rot.as_euler("xyz", degrees=True)
+    Rmat = rot.as_matrix()  # (N,3,3)
+
+    # Precompute human-readable local times
+    human_time = []
+    for ti in times:
+        if TZ_OSLO is not None:
+            dt_local = datetime.fromtimestamp(ti, TZ_OSLO)
+        else:
+            dt_local = datetime.fromtimestamp(ti)
+        human_time.append(dt_local.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
 
     return {
         "t": times,
@@ -112,6 +122,8 @@ def load_rigidbody_data(mcap_path, topic="/rigid_bodies", rb_name="0"):
         "pos": positions,
         "quat": quats,
         "rpy": rpy,
+        "Rmat": Rmat,
+        "human_time": human_time,
     }
 
 
@@ -132,6 +144,8 @@ def run_visualization(data, bag_path):
     quat = data["quat"]
     t = data["t"]
     frames = data["frame"]
+    Rmat_all = data["Rmat"]
+    human_time = data["human_time"]
 
     n = pos.shape[0]
     t0 = t[0]
@@ -139,6 +153,14 @@ def run_visualization(data, bag_path):
 
     base, _ = os.path.splitext(bag_path)
     csv_path = base + "_segments.csv"
+
+    # Choose playback step to avoid too many UI updates
+    # Control playback step size (skip frames when dataset is large)
+    if n <= 20000:
+        play_step = 1
+    else:
+        play_step = max(1, n // 20000)
+    print(f"[info] Total samples: {n}, playback step: {play_step}")
 
     fig = plt.figure(figsize=(11, 8))
     ax = fig.add_subplot(111, projection="3d")
@@ -239,7 +261,6 @@ def run_visualization(data, bag_path):
         bot_p1, bot_p2, bot_p3, bot_p4,
     ])
 
-    # Moving object
     base_point_color = "C0"
     point = ax.scatter(pos[0, 0], pos[0, 1], pos[0, 2],
                        s=50, depthshade=True, c=base_point_color)
@@ -249,11 +270,9 @@ def run_visualization(data, bag_path):
     body_y_line, = ax.plot([], [], [], color="g", linewidth=2)
     body_z_line, = ax.plot([], [], [], color="b", linewidth=2)
 
-    # Trajectories
     traj_line, = ax.plot([], [], [], "k-", linewidth=1.0, alpha=0.7)
     show_traj = True
 
-    # Recorded trajectory (orange, only recorded parts)
     rec_traj_line, = ax.plot([], [], [], "-", linewidth=2.0, alpha=0.9, color="orange")
     show_rec_traj = True
 
@@ -271,7 +290,6 @@ def run_visualization(data, bag_path):
         0.02, 0.95, "", fontsize=9, va="top", family="monospace"
     )
 
-    # REC indicator, slightly down
     rec_indicator = fig.text(
         0.88, 0.90, "REC ●", fontsize=12, va="top", ha="left",
         color="gray", family="monospace", weight="bold"
@@ -280,13 +298,11 @@ def run_visualization(data, bag_path):
     # Recording state
     recording = False
     record_mask = np.zeros(n, dtype=bool)
-    # Trajectory IDs: 0 = not recorded; 1,2,... = trajectory numbers
     traj_id = np.zeros(n, dtype=int)
     current_traj_id = 0
 
     fig.subplots_adjust(bottom=0.24, left=0.08, right=0.98, top=0.92)
 
-    # Bottom buttons
     ax_play = fig.add_axes([0.03, 0.03, 0.08, 0.05])
     btn_play = Button(ax_play, "Play")
 
@@ -312,7 +328,6 @@ def run_visualization(data, bag_path):
     ax_bounds_btn = fig.add_axes([0.85, 0.03, 0.12, 0.05])
     btn_bounds = Button(ax_bounds_btn, "Bounds ON")
 
-    # Slider
     ax_slider = fig.add_axes([0.15, 0.12, 0.7, 0.03])
     slider = Slider(
         ax_slider, "Time [s]",
@@ -321,7 +336,6 @@ def run_visualization(data, bag_path):
         valinit=float(t_rel[0]),
     )
 
-    # View buttons (top-right)
     ax_view_top = fig.add_axes([0.80, 0.93, 0.06, 0.04])
     ax_view_side = fig.add_axes([0.87, 0.93, 0.06, 0.04])
     ax_view_bottom = fig.add_axes([0.94, 0.93, 0.06, 0.04])
@@ -344,7 +358,6 @@ def run_visualization(data, bag_path):
 
         new_idx = int(np.clip(new_idx, 0, n - 1))
 
-        # Mark range between old idx and new_idx if recording
         if recording and allow_record and current_traj_id > 0:
             i0 = min(idx, new_idx)
             i1 = max(idx, new_idx)
@@ -358,14 +371,9 @@ def run_visualization(data, bag_path):
         time_abs = t[idx]
         time_rel_i = t_rel[idx]
         frame = frames[idx]
+        human_str = human_time[idx]
+        R_body = Rmat_all[idx]
 
-        if TZ_OSLO is not None:
-            dt_local = datetime.fromtimestamp(time_abs, TZ_OSLO)
-        else:
-            dt_local = datetime.fromtimestamp(time_abs)
-        human_str = dt_local.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
-        # ball color
         if recording:
             point.set_color("red")
         else:
@@ -373,7 +381,6 @@ def run_visualization(data, bag_path):
 
         point._offsets3d = ([x], [y], [z])
 
-        R_body = R.from_quat(quat[idx]).as_matrix()
         origin = np.array([x, y, z])
         axes_body = R_body @ (np.eye(3) * body_axis_len)
 
@@ -389,7 +396,6 @@ def run_visualization(data, bag_path):
         body_z_line.set_data([origin[0], z_end[0]], [origin[1], z_end[1]])
         body_z_line.set_3d_properties([origin[2], z_end[2]])
 
-        # Full trajectory (black)
         if show_traj:
             traj_line.set_data(pos[:idx + 1, 0], pos[:idx + 1, 1])
             traj_line.set_3d_properties(pos[:idx + 1, 2])
@@ -397,18 +403,15 @@ def run_visualization(data, bag_path):
         else:
             traj_line.set_visible(False)
 
-        # Recorded trajectory (orange), only where record_mask is True
         if show_rec_traj:
             m = idx + 1
             x_rec = pos[:m, 0].copy()
             y_rec = pos[:m, 1].copy()
             z_rec = pos[:m, 2].copy()
-
             mask_not_rec = ~record_mask[:m]
             x_rec[mask_not_rec] = np.nan
             y_rec[mask_not_rec] = np.nan
             z_rec[mask_not_rec] = np.nan
-
             rec_traj_line.set_data(x_rec, y_rec)
             rec_traj_line.set_3d_properties(z_rec)
             rec_traj_line.set_visible(True)
@@ -427,12 +430,12 @@ def run_visualization(data, bag_path):
         line6 = f"{'Recording:'.ljust(L)} {'ON' if recording else 'OFF'}"
         line7 = f"{'Recorded samples:'.ljust(L)} {n_rec}"
         line8 = f"{'Trajectory no:'.ljust(L)} {traj_here} (total={current_traj_id})"
+        line9 = f"{'Play step:'.ljust(L)} {play_step}"
 
         pose_text.set_text("\n".join(
-            [line1, line2, line3, line4, line5, line6, line7, line8]
+            [line1, line2, line3, line4, line5, line6, line7, line8, line9]
         ))
 
-        # REC indicator color
         rec_indicator.set_color("red" if recording else "gray")
 
         fig.canvas.draw_idle()
@@ -456,18 +459,15 @@ def run_visualization(data, bag_path):
         old_state = recording
         new_state = not recording
 
-        # If we were recording and now turning OFF: clamp future samples
+        # When turning OFF: clamp any future samples with this traj ID
         if old_state and not new_state and current_traj_id > 0:
-            # Any samples with this traj_id AFTER current idx are cleared
             future_idx = np.where((traj_id == current_traj_id) & (np.arange(n) > idx))[0]
             if future_idx.size > 0:
                 record_mask[future_idx] = False
                 traj_id[future_idx] = 0
 
-        # Apply new state
         recording = new_state
 
-        # Starting a new trajectory segment
         if (not old_state) and recording:
             current_traj_id += 1
 
@@ -479,7 +479,6 @@ def run_visualization(data, bag_path):
             btn_rec.color = rec_off_color
             btn_rec.hovercolor = rec_off_hover
 
-        # Refresh view immediately but don't mark new samples here
         update_index(idx, allow_record=False)
 
     def on_rec_traj_clicked(event):
@@ -490,19 +489,16 @@ def run_visualization(data, bag_path):
 
     def on_reset_clicked(event):
         nonlocal recording, record_mask, traj_id, current_traj_id
-        # turn recording off
         recording = False
         btn_rec.label.set_text("Rec OFF")
         btn_rec.color = rec_off_color
         btn_rec.hovercolor = rec_off_hover
         rec_indicator.set_color("gray")
 
-        # clear all recorded samples and trajectory IDs
         record_mask[:] = False
         traj_id[:] = 0
         current_traj_id = 0
 
-        # clear recorded trajectory line completely
         rec_traj_line.set_data([], [])
         rec_traj_line.set_3d_properties([])
 
@@ -537,12 +533,7 @@ def run_visualization(data, bag_path):
             writer.writerow(header)
             for i in selected_idx:
                 time_abs = t[i]
-                if TZ_OSLO is not None:
-                    dt_local = datetime.fromtimestamp(time_abs, TZ_OSLO)
-                else:
-                    dt_local = datetime.fromtimestamp(time_abs)
-                time_local_str = dt_local.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
+                time_local_str = human_time[i]
                 x, y, z = pos[i]
                 roll, pitch, yaw = rpy[i]
                 qx, qy, qz, qw = quat[i]
@@ -608,14 +599,15 @@ def run_visualization(data, bag_path):
     btn_view_side.on_clicked(on_view_side)
     btn_view_bottom.on_clicked(on_view_bottom)
 
-    timer = fig.canvas.new_timer(interval=33)
+    # Slightly slower timer to reduce CPU load
+    timer = fig.canvas.new_timer(interval=40)  # ~25 FPS target
 
     def on_timer(_):
         if not is_playing:
             return
         if slider.val >= t_rel[-1]:
             return
-        dt = (t_rel[-1] - t_rel[0]) / max(n, 1)
+        dt = play_step * (t_rel[-1] - t_rel[0]) / max(n, 1)
         slider.set_val(slider.val + dt)
 
     timer.add_callback(on_timer, None)
